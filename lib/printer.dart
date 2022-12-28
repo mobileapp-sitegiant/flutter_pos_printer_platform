@@ -1,4 +1,5 @@
 import 'package:flutter/services.dart';
+import 'dart:typed_data';
 
 final flutterPrinterChannel = const MethodChannel('com.sersoluciones.flutter_pos_printer_platform');
 final flutterPrinterEventChannelBT = const EventChannel('com.sersoluciones.flutter_pos_printer_platform/bt_state');
