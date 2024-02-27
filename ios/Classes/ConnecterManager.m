@@ -67,10 +67,14 @@ static dispatch_once_t once;
  *  连接 New
  */
 -(void)connectPeripheral:(CBPeripheral *)peripheral options:(nullable NSDictionary<NSString *,id> *)options timeout:(NSUInteger)timeout connectBlack:(void(^_Nullable)(ConnectState state)) connectState{
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self->_bleConnecter connectPeripheral:peripheral options:options timeout:timeout connectBlack:connectState];
-
-    });
+    
+    if(peripheral != nil){
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self->_bleConnecter connectPeripheral:peripheral options:options timeout:timeout connectBlack:connectState];
+        });
+    }else {
+        NSLog(@"Peripheral object is nil. Cannot proceed.");
+    }
 }
 
 // /**
