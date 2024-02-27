@@ -64,11 +64,21 @@ static dispatch_once_t once;
 }
 
 /**
- *  连接
+ *  连接 New
  */
 -(void)connectPeripheral:(CBPeripheral *)peripheral options:(nullable NSDictionary<NSString *,id> *)options timeout:(NSUInteger)timeout connectBlack:(void(^_Nullable)(ConnectState state)) connectState{
-    [_bleConnecter connectPeripheral:peripheral options:options timeout:timeout connectBlack:connectState];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self->_bleConnecter connectPeripheral:peripheral options:options timeout:timeout connectBlack:connectState];
+
+    });
 }
+
+// /**
+//  *  连接
+//  */
+// -(void)connectPeripheral:(CBPeripheral *)peripheral options:(nullable NSDictionary<NSString *,id> *)options timeout:(NSUInteger)timeout connectBlack:(void(^_Nullable)(ConnectState state)) connectState{
+//     [_bleConnecter connectPeripheral:peripheral options:options timeout:timeout connectBlack:connectState];
+// }
 
 -(void)connectPeripheral:(CBPeripheral * _Nullable)peripheral options:(nullable NSDictionary<NSString *,id> *)options {
     [_bleConnecter connectPeripheral:peripheral options:options];
