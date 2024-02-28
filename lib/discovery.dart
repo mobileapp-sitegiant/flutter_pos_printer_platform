@@ -11,7 +11,7 @@ class PrinterDiscovered<T> {
   });
 }
 
-typedef DiscoverResult<T> = Future<List<PrinterDiscovered<T>>>;
+typedef DiscoverResult<T> = Future<PrinterDiscovered<T>>;
 // typedef StarPrinterInfo = PortInfo;
 
 // DiscoverResult<StarPrinterInfo> discoverStarPrinter() async {
@@ -27,7 +27,7 @@ typedef DiscoverResult<T> = Future<List<PrinterDiscovered<T>>>;
 // }
 
 Future<List<PrinterDiscovered>> discoverPrinters(
-    {List<DiscoverResult Function()> modes = const [
+    {List<Function> modes = const [
       // discoverStarPrinter,
       UsbPrinterConnector.discoverPrinters,
       BluetoothPrinterConnector.discoverPrinters,
