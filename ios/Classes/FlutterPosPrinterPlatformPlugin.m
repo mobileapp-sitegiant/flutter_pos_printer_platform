@@ -82,7 +82,7 @@
       self.state = ^(ConnectState state) {
         [self updateConnectState:state];
       };
-      [Manager connectPeripheral:peripheral options:nil timeout:2 connectBlack: self.state];
+      [Manager connectPeripheral:peripheral options:nil timeout:5 connectBlack: self.state];
       
       result(nil);
     } @catch(FlutterError *e) {
