@@ -164,7 +164,7 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
         messageChannel = null
         messageUSBChannel = null
 
-        if(bluetoothService.isInitialized){
+        if(::bluetoothService.isInitialized){
             bluetoothService.setHandler(null)
         }
         adapter.setHandler(null)
