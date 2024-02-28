@@ -207,104 +207,107 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
 
     override fun onMethodCall(@NonNull call: MethodCall, @NonNull result: Result) {
         isScan = false
-        when {
-            call.method.equals("getBluetoothList") -> {
-                isBle = false
-                isScan = true
-                if (bluetoothService == null) {
-                    bluetoothService = BluetoothService.getInstance(bluetoothHandler)
+
+        if(::bluetoothService.isInitialized){
+            when {
+                call.method.equals("getBluetoothList") -> {
+                    isBle = false
+                    isScan = true
+                    if (bluetoothService == null) {
+                        bluetoothService = BluetoothService.getInstance(bluetoothHandler)
+                    }
+                    if (verifyIsBluetoothIsOn()) {
+                        bluetoothService.cleanHandlerBtBle()
+                        bluetoothService.scanBluDevice(channel)
+                        result.success(null)
+                    }
                 }
-                if (verifyIsBluetoothIsOn()) {
+                call.method.equals("getBluetoothLeList") -> {
+                    isBle = true
+                    isScan = true
+                    if (bluetoothService == null) {
+                        bluetoothService = BluetoothService.getInstance(bluetoothHandler)
+                    }
+                    if (verifyIsBluetoothIsOn()) {
+                        bluetoothService.scanBleDevice(channel)
+                        result.success(null)
+                    }
+                }
+
+                call.method.equals("onStartConnection") -> {
+                    val address: String? = call.argument("address")
+                    val isBle: Boolean? = call.argument("isBle")
+                    val autoConnect: Boolean = if (call.hasArgument("autoConnect")) call.argument("autoConnect")!! else false
+                    if (bluetoothService == null) {
+                        bluetoothService = BluetoothService.getInstance(bluetoothHandler)
+                    } 
+                    if (verifyIsBluetoothIsOn()) {
+                        bluetoothService.setHandler(bluetoothHandler)
+                        bluetoothService.onStartConnection(context!!, address!!, result, isBle = isBle!!, autoConnect = autoConnect)
+                    } else {
+                        result.success(false)
+                    }
+                }
+
+                call.method.equals("disconnect") -> {
+                    try {
+                        bluetoothService.setHandler(bluetoothHandler)
+                        bluetoothService.bluetoothDisconnect()
+                        result.success(true)
+                    } catch (e: Exception) {
+                        result.success(false)
+                    }
+
+                }
+
+                call.method.equals("sendDataByte") -> {
+                    if (verifyIsBluetoothIsOn()) {
+                        bluetoothService.setHandler(bluetoothHandler)
+                        val listInt: ArrayList<Int>? = call.argument("bytes")
+                        val ints = listInt!!.toIntArray()
+                        val bytes = ints.foldIndexed(ByteArray(ints.size)) { i, a, v -> a.apply { set(i, v.toByte()) } }
+                        val res = bluetoothService.sendDataByte(bytes)
+                        result.success(res)
+                    } else {
+                        result.success(false)
+                    }
+                }
+                call.method.equals("sendText") -> {
+                    if (verifyIsBluetoothIsOn()) {
+                        val text: String? = call.argument("text")
+                        bluetoothService.sendData(text!!)
+                        result.success(true)
+                    } else {
+                        result.success(false)
+                    }
+                }
+                call.method.equals("getList") -> {
                     bluetoothService.cleanHandlerBtBle()
-                    bluetoothService.scanBluDevice(channel)
-                    result.success(null)
+                    getUSBDeviceList(result)
                 }
-            }
-            call.method.equals("getBluetoothLeList") -> {
-                isBle = true
-                isScan = true
-                if (bluetoothService == null) {
-                    bluetoothService = BluetoothService.getInstance(bluetoothHandler)
+                call.method.equals("connectPrinter") -> {
+                    val vendor: Int? = call.argument("vendor")
+                    val product: Int? = call.argument("product")
+                    connectPrinter(vendor, product, result)
                 }
-                if (verifyIsBluetoothIsOn()) {
-                    bluetoothService.scanBleDevice(channel)
-                    result.success(null)
+                call.method.equals("close") -> {
+                    closeConn(result)
                 }
-            }
-
-            call.method.equals("onStartConnection") -> {
-                val address: String? = call.argument("address")
-                val isBle: Boolean? = call.argument("isBle")
-                val autoConnect: Boolean = if (call.hasArgument("autoConnect")) call.argument("autoConnect")!! else false
-                if (bluetoothService == null) {
-                    bluetoothService = BluetoothService.getInstance(bluetoothHandler)
-                } 
-                if (verifyIsBluetoothIsOn()) {
-                    bluetoothService.setHandler(bluetoothHandler)
-                    bluetoothService.onStartConnection(context!!, address!!, result, isBle = isBle!!, autoConnect = autoConnect)
-                } else {
-                    result.success(false)
-                }
-            }
-
-            call.method.equals("disconnect") -> {
-                try {
-                    bluetoothService.setHandler(bluetoothHandler)
-                    bluetoothService.bluetoothDisconnect()
-                    result.success(true)
-                } catch (e: Exception) {
-                    result.success(false)
-                }
-
-            }
-
-            call.method.equals("sendDataByte") -> {
-                if (verifyIsBluetoothIsOn()) {
-                    bluetoothService.setHandler(bluetoothHandler)
-                    val listInt: ArrayList<Int>? = call.argument("bytes")
-                    val ints = listInt!!.toIntArray()
-                    val bytes = ints.foldIndexed(ByteArray(ints.size)) { i, a, v -> a.apply { set(i, v.toByte()) } }
-                    val res = bluetoothService.sendDataByte(bytes)
-                    result.success(res)
-                } else {
-                    result.success(false)
-                }
-            }
-            call.method.equals("sendText") -> {
-                if (verifyIsBluetoothIsOn()) {
+                call.method.equals("printText") -> {
                     val text: String? = call.argument("text")
-                    bluetoothService.sendData(text!!)
-                    result.success(true)
-                } else {
-                    result.success(false)
+                    printText(text, result)
                 }
-            }
-            call.method.equals("getList") -> {
-                bluetoothService.cleanHandlerBtBle()
-                getUSBDeviceList(result)
-            }
-            call.method.equals("connectPrinter") -> {
-                val vendor: Int? = call.argument("vendor")
-                val product: Int? = call.argument("product")
-                connectPrinter(vendor, product, result)
-            }
-            call.method.equals("close") -> {
-                closeConn(result)
-            }
-            call.method.equals("printText") -> {
-                val text: String? = call.argument("text")
-                printText(text, result)
-            }
-            call.method.equals("printRawData") -> {
-                val raw: String? = call.argument("raw")
-                printRawData(raw, result)
-            }
-            call.method.equals("printBytes") -> {
-                val bytes: ArrayList<Int>? = call.argument("bytes")
-                printBytes(bytes, result)
-            }
-            else -> {
-                result.notImplemented()
+                call.method.equals("printRawData") -> {
+                    val raw: String? = call.argument("raw")
+                    printRawData(raw, result)
+                }
+                call.method.equals("printBytes") -> {
+                    val bytes: ArrayList<Int>? = call.argument("bytes")
+                    printBytes(bytes, result)
+                }
+                else -> {
+                    result.notImplemented()
+                }
             }
         }
     }
