@@ -66,7 +66,7 @@ static dispatch_once_t once;
 /**
  *  连接 New
  */
--(void)connectPeripheral:(CBPeripheral *)peripheral options:(nullable NSDictionary<NSString *,id> *)options timeout:(NSUInteger)timeout connectBlack:(void(^_Nullable)(ConnectState state)) connectState{
+-(void)connectPeripheral:(CBPeripheral *_Nullable)peripheral options:(nullable NSDictionary<NSString *,id> *)options timeout:(NSUInteger)timeout connectBlack:(void(^_Nullable)(ConnectState state)) connectState{
     
     if(peripheral != nil){
         dispatch_async(dispatch_get_main_queue(), ^{
