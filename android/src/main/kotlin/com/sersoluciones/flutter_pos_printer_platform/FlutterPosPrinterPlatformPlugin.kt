@@ -164,7 +164,9 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
         messageChannel = null
         messageUSBChannel = null
 
-        bluetoothService.setHandler(null)
+        if(::bluetoothService.isInitialized){
+            bluetoothService.setHandler(null)
+        }
         adapter.setHandler(null)
     }
 
@@ -209,6 +211,9 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
             call.method.equals("getBluetoothList") -> {
                 isBle = false
                 isScan = true
+                if (bluetoothService == null) {
+                    bluetoothService = BluetoothService.getInstance(bluetoothHandler)
+                }
                 if (verifyIsBluetoothIsOn()) {
                     bluetoothService.cleanHandlerBtBle()
                     bluetoothService.scanBluDevice(channel)
@@ -218,6 +223,9 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
             call.method.equals("getBluetoothLeList") -> {
                 isBle = true
                 isScan = true
+                if (bluetoothService == null) {
+                    bluetoothService = BluetoothService.getInstance(bluetoothHandler)
+                }
                 if (verifyIsBluetoothIsOn()) {
                     bluetoothService.scanBleDevice(channel)
                     result.success(null)
@@ -228,6 +236,9 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
                 val address: String? = call.argument("address")
                 val isBle: Boolean? = call.argument("isBle")
                 val autoConnect: Boolean = if (call.hasArgument("autoConnect")) call.argument("autoConnect")!! else false
+                if (bluetoothService == null) {
+                    bluetoothService = BluetoothService.getInstance(bluetoothHandler)
+                } 
                 if (verifyIsBluetoothIsOn()) {
                     bluetoothService.setHandler(bluetoothHandler)
                     bluetoothService.onStartConnection(context!!, address!!, result, isBle = isBle!!, autoConnect = autoConnect)
