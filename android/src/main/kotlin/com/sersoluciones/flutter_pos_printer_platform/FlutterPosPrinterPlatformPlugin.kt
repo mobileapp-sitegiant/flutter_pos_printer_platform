@@ -260,10 +260,9 @@ class FlutterPosPrinterPlatformPlugin : FlutterPlugin, MethodCallHandler, Plugin
 
             call.method.equals("sendDataByte") -> {
                 if (verifyIsBluetoothIsOn()) {
-                    bluetoothService.setHandler(bluetoothHandler)
-                    val listInt: ArrayList<Int>? = call.argument("bytes")
-                    val ints = listInt!!.toIntArray()
-                    val bytes = ints.foldIndexed(ByteArray(ints.size)) { i, a, v -> a.apply { set(i, v.toByte()) } }
+                    val bytes: ByteArray? = call.argument("bytes")
+                    //val ints = listInt!!.toIntArray()
+                    //val bytes = ints.foldIndexed(ByteArrayx(ints.size)) { i, a, v -> a.apply { set(i, v.toByte()) } }
                     val res = bluetoothService.sendDataByte(bytes)
                     result.success(res)
                 } else {
