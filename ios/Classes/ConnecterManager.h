@@ -70,7 +70,7 @@ typedef enum : NSUInteger{
  *  @param timeout 连接时间
  *  @param connectState 连接状态
  */
--(void)connectPeripheral:(CBPeripheral *)peripheral options:(nullable NSDictionary<NSString *,id> *)options timeout:(NSUInteger)timeout connectBlack:(void(^_Nullable)(ConnectState state)) connectState;
+-(void)connectPeripheral:(CBPeripheral *_Nullable)peripheral options:(nullable NSDictionary<NSString *,id> *)options timeout:(NSUInteger)timeout connectBlack:(void(^_Nullable)(ConnectState state)) connectState;
 
 /**
  *  方法说明：连接外设
