@@ -162,6 +162,12 @@ class FlutterPosPrinterPlatformPlugin :
             }
 
     override fun onDetachedFromEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
+
+        if(!::bluetoothService.isInitialized){
+            Log.d(TAG, "onMethodCall bluetoothService not init");
+            bluetoothService = BluetoothService.getInstance(bluetoothHandler)
+        }
+
         channel.setMethodCallHandler(null)
         messageChannel?.setStreamHandler(null)
         messageUSBChannel?.setStreamHandler(null)
@@ -169,7 +175,10 @@ class FlutterPosPrinterPlatformPlugin :
         messageChannel = null
         messageUSBChannel = null
 
-        bluetoothService.setHandler(null)
+        if(::bluetoothService.isInitialized){
+            bluetoothService.setHandler(null)
+        }
+
         adapter.setHandler(null)
     }
 
