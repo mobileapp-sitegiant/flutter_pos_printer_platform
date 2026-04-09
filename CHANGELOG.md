@@ -1,3 +1,9 @@
+## 1.2.4
+* Upgraded to support android 14 and fix USB printing issue 
+* Credits: 
+   - https://github.com/diantahoc/flutter_pos_printer_platform
+   - https://github.com/nasibudesign/thermal_printer/
+
 ## 1.0.12
 
 * Resolve minor bug [Android] 12
