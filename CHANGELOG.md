@@ -1,3 +1,7 @@
+## 1.2.5
+* [iOS] Fix fatal crash `NSInternalInconsistencyException: Invalid parameter not satisfying: peripheral != nil` — GSDK's connect-timeout timer calls `cancelPeripheralConnection:` with a nil peripheral when the printer is unreachable; guarded at runtime via `CBCentralManagerSafeCancel`
+* [iOS] Clear dangling `_connecter` reference in `ConnecterManager close`
+
 ## 1.2.4
 * Upgraded to support android 14 and fix USB printing issue 
 * Credits: 
