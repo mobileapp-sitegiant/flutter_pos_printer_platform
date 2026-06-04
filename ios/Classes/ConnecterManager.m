@@ -122,6 +122,7 @@ static dispatch_once_t once;
     switch (currentConnMethod) {
         case BLUETOOTH:
             _bleConnecter = nil;
+            _connecter = nil;
             break;
     }
 }
