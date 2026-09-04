@@ -19,9 +19,17 @@ A new Flutter plugin project.
   s.dependency 'Flutter'
   s.platform = :ios, '12.0'
 
-  # Import all * .a libraries in the Classes folder
   s.frameworks = ["SystemConfiguration", "CoreTelephony","WebKit"]
-  s.vendored_libraries = '**/*.a'
+
+  # libGSDK.a (Gprinter SDK, closed source) only ships a *device* arm64 slice.
+  # Linking it into an arm64 simulator build fails, so it is linked for the
+  # iphoneos SDK only. On the simulator the Bluetooth connecter is stubbed out
+  # (see TARGET_OS_SIMULATOR in ConnecterManager.m) and nothing references it.
+  s.preserve_paths = 'libGSDK.a'
+  s.user_target_xcconfig = {
+    'OTHER_LDFLAGS[sdk=iphoneos*]' => '$(inherited) -l"GSDK"',
+    'LIBRARY_SEARCH_PATHS[sdk=iphoneos*]' => '$(inherited) "${PODS_ROOT}/../.symlinks/plugins/flutter_pos_printer_platform/ios"',
+  }
 
   # Flutter.framework does not contain a i386 slice.
   s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES', 'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386' }

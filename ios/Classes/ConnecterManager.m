@@ -48,8 +48,15 @@ static dispatch_once_t once;
 -(void)initConnecter:(ConnectMethod)connectMethod {
     switch (connectMethod) {
         case BLUETOOTH:
+#if TARGET_OS_SIMULATOR
+            // libGSDK.a has no simulator slice, so BLEConnecter is not linked
+            // on the simulator. Leave the connecter nil; every call on it
+            // becomes a no-op and printing is simply unavailable.
+            NSLog(@"GSDK Bluetooth connecter is unavailable on the iOS simulator.");
+#else
             _bleConnecter = [BLEConnecter new];
             _connecter = _bleConnecter;
+#endif
             break;
         default:
             break;
