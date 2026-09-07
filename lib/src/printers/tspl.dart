@@ -2,7 +2,7 @@ import 'dart:core';
 import 'dart:typed_data';
 
 import 'package:flutter_pos_printer_platform/printer.dart';
-import 'package:image_v3/image_v3.dart';
+import 'package:image/image.dart' hide ImageData;
 
 import '../utils.dart';
 
@@ -233,7 +233,7 @@ class TsplPrinter<T> extends GenericPrinter<T> {
     final int widthPx = image.width;
     final int heightPx = image.height;
     final int widthBytes = widthPx ~/ 8; // one byte is 8 bits
-    final List<int> imageBytes = image.getBytes(format: Format.argb);
+    final List<int> imageBytes = image.getBytes(order: ChannelOrder.argb);
 
     List<int> monoPixel = [];
     for (int i = 0; i < imageBytes.length; i += 4) {
