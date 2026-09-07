@@ -1,11 +1,27 @@
 #import "FlutterPosPrinterPlatformPlugin.h"
 #import "ConnecterManager.h"
 
+// Paced Bluetooth LE writer
+//
+// Bluetooth LE thermal printers (XPrinter and similar) have a small receive
+// buffer and no flow control above the link layer. GSDK's -[ConnecterManager
+// write:] pushes data as fast as CoreBluetooth accepts it, so any payload
+// larger than the printer's buffer is partly dropped: the receipt prints as
+// garbage, stops halfway, or comes out as a single line feed. Sending in small
+// chunks at a fixed byte rate keeps delivery below the print head's consumption
+// so the buffer never overflows. Payloads are queued so two prints (e.g. cash
+// drawer + receipt) never interleave.
+static const NSUInteger kBleMaxChunkBytes = 128;
+static const double kBleBytesPerSecond = 3000.0;
+static const NSTimeInterval kBleLinkBusyRetry = 0.005;
+
 @interface FlutterPosPrinterPlatformPlugin ()
 @property(nonatomic, retain) NSObject<FlutterPluginRegistrar> *registrar;
 @property(nonatomic, retain) FlutterMethodChannel *channel;
 @property(nonatomic, retain) BluetoothPrintStreamHandler *stateStreamHandler;
 @property(nonatomic) NSMutableDictionary *scannedPeripherals;
+@property(nonatomic, strong) NSMutableArray<NSData *> *pendingWrites;
+@property(nonatomic, assign) BOOL bleWriteInProgress;
 @end
 
 @implementation FlutterPosPrinterPlatformPlugin
@@ -111,12 +127,126 @@
            }
            NSData *data2 = [NSData dataWithBytes:cArray length:sizeof(cArray)];
 //           NSLog(@"bytes in hex: %@", [data2 description]);
-           [Manager write:data2];
+           if (![self enqueuePacedWrite:data2]) {
+               // No BLE peripheral/characteristic exposed by GSDK: fall back
+               // to the SDK's own writer.
+               [Manager write:data2];
+           }
            result(nil);
        } @catch(FlutterError *e) {
            result(e);
        }
   }
+}
+
+#pragma mark - Paced BLE write
+
+/// Queues [data] for paced delivery. Returns NO when GSDK has not exposed a
+/// connected peripheral + write characteristic (caller falls back to GSDK).
+- (BOOL)enqueuePacedWrite:(NSData *)data {
+    BLEConnecter *ble = Manager.bleConnecter;
+    CBPeripheral *peripheral = ble.connPeripheral;
+    CBCharacteristic *characteristic = ble.transparentDataWriteChar;
+    if (peripheral == nil || characteristic == nil ||
+        peripheral.state != CBPeripheralStateConnected) {
+        return NO;
+    }
+    if (self.pendingWrites == nil) {
+        self.pendingWrites = [NSMutableArray new];
+    }
+    [self.pendingWrites addObject:data];
+    NSLog(@"paced BLE write queued: %lu bytes (queue=%lu)",
+          (unsigned long)data.length, (unsigned long)self.pendingWrites.count);
+    [self startNextPacedWriteIfIdle];
+    return YES;
+}
+
+- (void)startNextPacedWriteIfIdle {
+    if (self.bleWriteInProgress || self.pendingWrites.count == 0) {
+        return;
+    }
+    NSData *data = self.pendingWrites.firstObject;
+    [self.pendingWrites removeObjectAtIndex:0];
+
+    BLEConnecter *ble = Manager.bleConnecter;
+    CBPeripheral *peripheral = ble.connPeripheral;
+    CBCharacteristic *characteristic = ble.transparentDataWriteChar;
+    if (peripheral == nil || characteristic == nil ||
+        peripheral.state != CBPeripheralStateConnected) {
+        NSLog(@"paced BLE write dropped: printer disconnected");
+        [self startNextPacedWriteIfIdle];
+        return;
+    }
+
+    // Prefer write-without-response when the printer offers it (throughput);
+    // CoreBluetooth's canSendWriteWithoutResponse is honoured below so the
+    // link queue itself never overflows either.
+    CBCharacteristicWriteType type =
+        (characteristic.properties & CBCharacteristicPropertyWriteWithoutResponse)
+            ? CBCharacteristicWriteWithoutResponse
+            : CBCharacteristicWriteWithResponse;
+    NSUInteger maxLen = [peripheral maximumWriteValueLengthForType:type];
+    NSUInteger chunk = MIN(kBleMaxChunkBytes, maxLen > 0 ? maxLen : kBleMaxChunkBytes);
+    NSTimeInterval delay = chunk / kBleBytesPerSecond;
+
+    NSLog(@"paced BLE write start: %lu bytes, chunk=%lu, type=%@, delay=%.0fms",
+          (unsigned long)data.length, (unsigned long)chunk,
+          type == CBCharacteristicWriteWithoutResponse ? @"noResp" : @"resp",
+          delay * 1000);
+
+    self.bleWriteInProgress = YES;
+    [self writeChunkOf:data
+                offset:0
+                 chunk:chunk
+                 delay:delay
+                  type:type
+            peripheral:peripheral
+        characteristic:characteristic];
+}
+
+- (void)writeChunkOf:(NSData *)data
+              offset:(NSUInteger)offset
+               chunk:(NSUInteger)chunk
+               delay:(NSTimeInterval)delay
+                type:(CBCharacteristicWriteType)type
+          peripheral:(CBPeripheral *)peripheral
+      characteristic:(CBCharacteristic *)characteristic {
+    if (offset >= data.length) {
+        NSLog(@"paced BLE write done: %lu bytes", (unsigned long)data.length);
+        self.bleWriteInProgress = NO;
+        [self startNextPacedWriteIfIdle];
+        return;
+    }
+    if (peripheral.state != CBPeripheralStateConnected) {
+        NSLog(@"paced BLE write aborted at %lu/%lu: printer disconnected",
+              (unsigned long)offset, (unsigned long)data.length);
+        self.bleWriteInProgress = NO;
+        [self.pendingWrites removeAllObjects];
+        return;
+    }
+    __weak typeof(self) weakSelf = self;
+    if (type == CBCharacteristicWriteWithoutResponse &&
+        !peripheral.canSendWriteWithoutResponse) {
+        // Link-layer queue is full; wait without advancing the offset.
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)(kBleLinkBusyRetry * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [weakSelf writeChunkOf:data offset:offset chunk:chunk delay:delay
+                              type:type peripheral:peripheral
+                    characteristic:characteristic];
+        });
+        return;
+    }
+    NSUInteger len = MIN(chunk, data.length - offset);
+    [peripheral writeValue:[data subdataWithRange:NSMakeRange(offset, len)]
+         forCharacteristic:characteristic
+                      type:type];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [weakSelf writeChunkOf:data offset:offset + len chunk:chunk delay:delay
+                          type:type peripheral:peripheral
+                characteristic:characteristic];
+    });
 }
 
 -(void)startScan {
