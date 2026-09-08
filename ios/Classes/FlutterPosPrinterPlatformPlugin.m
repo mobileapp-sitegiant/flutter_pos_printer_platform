@@ -1,5 +1,6 @@
 #import "FlutterPosPrinterPlatformPlugin.h"
 #import "ConnecterManager.h"
+#import "EscPosTokenizer.h"
 
 // Paced Bluetooth LE writer
 //
@@ -161,6 +162,11 @@ static const NSTimeInterval kBleLinkBusyRetry = 0.005;
     return YES;
 }
 
+/// Pops the next payload and sends it as command-aligned units. Pauses are
+/// inserted only between units, never inside an ESC/POS command: printer
+/// firmware aborts a command whose parameter bytes stop arriving for a few
+/// tens of milliseconds and prints the remainder as text (seen as one
+/// garbage block per 24-dot bit-image strip).
 - (void)startNextPacedWriteIfIdle {
     if (self.bleWriteInProgress || self.pendingWrites.count == 0) {
         return;
@@ -178,43 +184,92 @@ static const NSTimeInterval kBleLinkBusyRetry = 0.005;
         return;
     }
 
-    // Prefer write-without-response when the printer offers it (throughput);
-    // CoreBluetooth's canSendWriteWithoutResponse is honoured below so the
-    // link queue itself never overflows either.
     CBCharacteristicWriteType type =
         (characteristic.properties & CBCharacteristicPropertyWriteWithoutResponse)
             ? CBCharacteristicWriteWithoutResponse
             : CBCharacteristicWriteWithResponse;
     NSUInteger maxLen = [peripheral maximumWriteValueLengthForType:type];
     NSUInteger chunk = MIN(kBleMaxChunkBytes, maxLen > 0 ? maxLen : kBleMaxChunkBytes);
-    NSTimeInterval delay = chunk / kBleBytesPerSecond;
 
-    NSLog(@"paced BLE write start: %lu bytes, chunk=%lu, type=%@, delay=%.0fms",
-          (unsigned long)data.length, (unsigned long)chunk,
+    // Atomic tokens (complete commands) stay whole; text runs and raster
+    // data are cut into chunk-sized units so pacing can happen between them.
+    NSMutableArray<NSValue *> *units = [NSMutableArray new];
+    for (EscPosToken *token in [EscPosTokenizer tokenize:data]) {
+        if (token.atomic || token.range.length <= chunk) {
+            [units addObject:[NSValue valueWithRange:token.range]];
+            continue;
+        }
+        NSUInteger offset = token.range.location;
+        const NSUInteger end = NSMaxRange(token.range);
+        while (offset < end) {
+            NSUInteger len = MIN(chunk, end - offset);
+            [units addObject:[NSValue valueWithRange:NSMakeRange(offset, len)]];
+            offset += len;
+        }
+    }
+
+    NSLog(@"paced BLE write start: %lu bytes, %lu units, chunk=%lu, type=%@, rate=%.0f B/s",
+          (unsigned long)data.length, (unsigned long)units.count, (unsigned long)chunk,
           type == CBCharacteristicWriteWithoutResponse ? @"noResp" : @"resp",
-          delay * 1000);
+          kBleBytesPerSecond);
 
     self.bleWriteInProgress = YES;
-    [self writeChunkOf:data
-                offset:0
-                 chunk:chunk
-                 delay:delay
-                  type:type
-            peripheral:peripheral
-        characteristic:characteristic];
+    [self sendUnitAtIndex:0
+                    units:units
+                     data:data
+                    chunk:chunk
+                     type:type
+               peripheral:peripheral
+           characteristic:characteristic];
 }
 
-- (void)writeChunkOf:(NSData *)data
-              offset:(NSUInteger)offset
-               chunk:(NSUInteger)chunk
-               delay:(NSTimeInterval)delay
-                type:(CBCharacteristicWriteType)type
-          peripheral:(CBPeripheral *)peripheral
-      characteristic:(CBCharacteristic *)characteristic {
-    if (offset >= data.length) {
+- (void)sendUnitAtIndex:(NSUInteger)index
+                  units:(NSArray<NSValue *> *)units
+                   data:(NSData *)data
+                  chunk:(NSUInteger)chunk
+                   type:(CBCharacteristicWriteType)type
+             peripheral:(CBPeripheral *)peripheral
+         characteristic:(CBCharacteristic *)characteristic {
+    if (index >= units.count) {
         NSLog(@"paced BLE write done: %lu bytes", (unsigned long)data.length);
         self.bleWriteInProgress = NO;
         [self startNextPacedWriteIfIdle];
+        return;
+    }
+    const NSRange unit = [units[index] rangeValue];
+    __weak typeof(self) weakSelf = self;
+    [self writeUnit:unit
+             offset:unit.location
+               data:data
+              chunk:chunk
+               type:type
+         peripheral:peripheral
+     characteristic:characteristic
+         completion:^{
+        // Give the print head time to consume this unit before the next one.
+        NSTimeInterval delay = unit.length / kBleBytesPerSecond;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [weakSelf sendUnitAtIndex:index + 1 units:units data:data chunk:chunk
+                                 type:type peripheral:peripheral characteristic:characteristic];
+        });
+    }];
+}
+
+/// Writes one unit in chunk-sized pieces back to back. The only wait inside
+/// a unit is CoreBluetooth's own link-queue readiness, which is at most one
+/// connection interval, the same cadence GSDK's writer produces.
+- (void)writeUnit:(NSRange)unit
+           offset:(NSUInteger)offset
+             data:(NSData *)data
+            chunk:(NSUInteger)chunk
+             type:(CBCharacteristicWriteType)type
+       peripheral:(CBPeripheral *)peripheral
+   characteristic:(CBCharacteristic *)characteristic
+       completion:(dispatch_block_t)completion {
+    const NSUInteger end = NSMaxRange(unit);
+    if (offset >= end) {
+        completion();
         return;
     }
     if (peripheral.state != CBPeripheralStateConnected) {
@@ -227,25 +282,21 @@ static const NSTimeInterval kBleLinkBusyRetry = 0.005;
     __weak typeof(self) weakSelf = self;
     if (type == CBCharacteristicWriteWithoutResponse &&
         !peripheral.canSendWriteWithoutResponse) {
-        // Link-layer queue is full; wait without advancing the offset.
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                      (int64_t)(kBleLinkBusyRetry * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            [weakSelf writeChunkOf:data offset:offset chunk:chunk delay:delay
-                              type:type peripheral:peripheral
-                    characteristic:characteristic];
+            [weakSelf writeUnit:unit offset:offset data:data chunk:chunk type:type
+                     peripheral:peripheral characteristic:characteristic completion:completion];
         });
         return;
     }
-    NSUInteger len = MIN(chunk, data.length - offset);
+    const NSUInteger len = MIN(chunk, end - offset);
     [peripheral writeValue:[data subdataWithRange:NSMakeRange(offset, len)]
          forCharacteristic:characteristic
                       type:type];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        [weakSelf writeChunkOf:data offset:offset + len chunk:chunk delay:delay
-                          type:type peripheral:peripheral
-                characteristic:characteristic];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [weakSelf writeUnit:unit offset:offset + len data:data chunk:chunk type:type
+                 peripheral:peripheral characteristic:characteristic completion:completion];
     });
 }
 
