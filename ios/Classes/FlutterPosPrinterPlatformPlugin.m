@@ -8,13 +8,21 @@
 // buffer and no flow control above the link layer. GSDK's -[ConnecterManager
 // write:] pushes data as fast as CoreBluetooth accepts it, so any payload
 // larger than the printer's buffer is partly dropped: the receipt prints as
-// garbage, stops halfway, or comes out as a single line feed. Sending in small
-// chunks at a fixed byte rate keeps delivery below the print head's consumption
-// so the buffer never overflows. Payloads are queued so two prints (e.g. cash
-// drawer + receipt) never interleave.
+// garbage, stops halfway, or comes out as a single line feed.
+//
+// The writer below sends the payload as command-aligned units (see
+// EscPosTokenizer) and, after each unit, waits roughly as long as the print
+// head needs to physically render it (feed distance at a worst-case print
+// speed). Pauses never fall inside a command: firmware aborts a command whose
+// parameter bytes stall and prints the remainder as text.
 static const NSUInteger kBleMaxChunkBytes = 244;
-static const double kBleBytesPerSecond = 8000.0;
 static const NSTimeInterval kBleLinkBusyRetry = 0.005;
+static const double kPrintSpeedMmPerMs = 0.08;   // 80 mm/s, slowest common tier
+static const double kDotsPerMm = 8.0;            // 203 dpi
+static const NSUInteger kTextLineHeightDots = 32; // font A line + spacing, conservative
+static const double kFeedSafetyMarginMs = 5.0;   // per feeding unit, covers link jitter
+static const double kCutSettleMs = 500.0;         // autocutter mechanical cycle
+static const double kUnknownDataBytesPerMs = 8.0; // fallback: 8 KB/s for unparsed data
 
 @interface FlutterPosPrinterPlatformPlugin ()
 @property(nonatomic, retain) NSObject<FlutterPluginRegistrar> *registrar;
@@ -162,11 +170,74 @@ static const NSTimeInterval kBleLinkBusyRetry = 0.005;
     return YES;
 }
 
+static double msForFeedDots(double dots) {
+    if (dots <= 0) {
+        return 0;
+    }
+    return (dots / kDotsPerMm) / kPrintSpeedMmPerMs + kFeedSafetyMarginMs;
+}
+
+/// Milliseconds the printer needs to render one unit. `rasterWidthBytes` is
+/// the row width of the GS v 0 image whose data is currently streaming (0 when
+/// not inside one).
+static double pacingMsForUnit(const uint8_t *b, NSRange unit, BOOL atomic,
+                              NSUInteger *rasterWidthBytes) {
+    if (unit.length == 0) {
+        return 0;
+    }
+    const uint8_t c0 = b[unit.location];
+    const uint8_t c1 = unit.length > 1 ? b[unit.location + 1] : 0;
+    const uint8_t c2 = unit.length > 2 ? b[unit.location + 2] : 0;
+
+    if (!atomic) {
+        if (c0 == 0x0a) {
+            return msForFeedDots(kTextLineHeightDots);
+        }
+        if (*rasterWidthBytes > 0) {
+            // GS v 0 pixel rows: one row per widthBytes.
+            double rows = ceil((double)unit.length / (double)*rasterWidthBytes);
+            return msForFeedDots(rows);
+        }
+        // Text run without a line feed: nothing prints yet.
+        return 0;
+    }
+
+    // Leaving raster data resets the row width.
+    *rasterWidthBytes = 0;
+
+    if (c0 == 0x1b) {
+        switch (c1) {
+            case '*':  // ESC * m nL nH: 24-dot (m >= 32) or 8-dot strip
+                return msForFeedDots(c2 >= 32 ? 24 : 8);
+            case 'd':  // ESC d n: feed n lines
+            case 'e':
+                return msForFeedDots((double)c2 * kTextLineHeightDots);
+            case 'J':  // ESC J n: feed n dots
+                return msForFeedDots(c2);
+            default:
+                return 0;
+        }
+    }
+    if (c0 == 0x1d) {
+        if (c1 == 'v' && unit.length >= 8) {
+            *rasterWidthBytes = b[unit.location + 4] | (b[unit.location + 5] << 8);
+            return 0;
+        }
+        if (c1 == 'V') {
+            return kCutSettleMs;
+        }
+        if (c1 == '(' && c2 == 'L') {
+            // Raster via GS ( L: width not parsed, pace its data by bytes.
+            *rasterWidthBytes = 0;
+            return 0;
+        }
+        return 0;
+    }
+    return 0;
+}
+
 /// Pops the next payload and sends it as command-aligned units. Pauses are
-/// inserted only between units, never inside an ESC/POS command: printer
-/// firmware aborts a command whose parameter bytes stop arriving for a few
-/// tens of milliseconds and prints the remainder as text (seen as one
-/// garbage block per 24-dot bit-image strip).
+/// inserted only between units, never inside an ESC/POS command.
 - (void)startNextPacedWriteIfIdle {
     if (self.bleWriteInProgress || self.pendingWrites.count == 0) {
         return;
@@ -193,29 +264,50 @@ static const NSTimeInterval kBleLinkBusyRetry = 0.005;
 
     // Atomic tokens (complete commands) stay whole; text runs and raster
     // data are cut into chunk-sized units so pacing can happen between them.
+    // Each unit gets the time the printer needs to render it.
+    const uint8_t *bytes = data.bytes;
     NSMutableArray<NSValue *> *units = [NSMutableArray new];
+    NSMutableArray<NSNumber *> *delaysMs = [NSMutableArray new];
+    NSUInteger rasterWidthBytes = 0;
+    double totalMs = 0;
     for (EscPosToken *token in [EscPosTokenizer tokenize:data]) {
         if (token.atomic || token.range.length <= chunk) {
+            double ms = pacingMsForUnit(bytes, token.range, token.atomic, &rasterWidthBytes);
+            if (!token.atomic && rasterWidthBytes == 0 && bytes[token.range.location] != 0x0a
+                && token.range.length > 64) {
+                // Unparsed bulk data (e.g. GS ( L payload): byte-rate fallback.
+                ms = token.range.length / kUnknownDataBytesPerMs;
+            }
             [units addObject:[NSValue valueWithRange:token.range]];
+            [delaysMs addObject:@(ms)];
+            totalMs += ms;
             continue;
         }
         NSUInteger offset = token.range.location;
         const NSUInteger end = NSMaxRange(token.range);
         while (offset < end) {
             NSUInteger len = MIN(chunk, end - offset);
-            [units addObject:[NSValue valueWithRange:NSMakeRange(offset, len)]];
+            NSRange piece = NSMakeRange(offset, len);
+            double ms = pacingMsForUnit(bytes, piece, NO, &rasterWidthBytes);
+            if (rasterWidthBytes == 0) {
+                ms = len / kUnknownDataBytesPerMs;
+            }
+            [units addObject:[NSValue valueWithRange:piece]];
+            [delaysMs addObject:@(ms)];
+            totalMs += ms;
             offset += len;
         }
     }
 
-    NSLog(@"paced BLE write start: %lu bytes, %lu units, chunk=%lu, type=%@, rate=%.0f B/s",
+    NSLog(@"paced BLE write start: %lu bytes, %lu units, chunk=%lu, type=%@, est. %.1fs",
           (unsigned long)data.length, (unsigned long)units.count, (unsigned long)chunk,
           type == CBCharacteristicWriteWithoutResponse ? @"noResp" : @"resp",
-          kBleBytesPerSecond);
+          totalMs / 1000.0);
 
     self.bleWriteInProgress = YES;
     [self sendUnitAtIndex:0
                     units:units
+                 delaysMs:delaysMs
                      data:data
                     chunk:chunk
                      type:type
@@ -225,6 +317,7 @@ static const NSTimeInterval kBleLinkBusyRetry = 0.005;
 
 - (void)sendUnitAtIndex:(NSUInteger)index
                   units:(NSArray<NSValue *> *)units
+               delaysMs:(NSArray<NSNumber *> *)delaysMs
                    data:(NSData *)data
                   chunk:(NSUInteger)chunk
                    type:(CBCharacteristicWriteType)type
@@ -237,7 +330,13 @@ static const NSTimeInterval kBleLinkBusyRetry = 0.005;
         return;
     }
     const NSRange unit = [units[index] rangeValue];
+    const double delayMs = delaysMs[index].doubleValue;
     __weak typeof(self) weakSelf = self;
+    dispatch_block_t next = ^{
+        [weakSelf sendUnitAtIndex:index + 1 units:units delaysMs:delaysMs data:data
+                            chunk:chunk type:type peripheral:peripheral
+                   characteristic:characteristic];
+    };
     [self writeUnit:unit
              offset:unit.location
                data:data
@@ -246,13 +345,12 @@ static const NSTimeInterval kBleLinkBusyRetry = 0.005;
          peripheral:peripheral
      characteristic:characteristic
          completion:^{
-        // Give the print head time to consume this unit before the next one.
-        NSTimeInterval delay = unit.length / kBleBytesPerSecond;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            [weakSelf sendUnitAtIndex:index + 1 units:units data:data chunk:chunk
-                                 type:type peripheral:peripheral characteristic:characteristic];
-        });
+        if (delayMs <= 0) {
+            next();
+            return;
+        }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayMs * NSEC_PER_MSEC)),
+                       dispatch_get_main_queue(), next);
     }];
 }
 
