@@ -11,8 +11,8 @@
 // chunks at a fixed byte rate keeps delivery below the print head's consumption
 // so the buffer never overflows. Payloads are queued so two prints (e.g. cash
 // drawer + receipt) never interleave.
-static const NSUInteger kBleMaxChunkBytes = 128;
-static const double kBleBytesPerSecond = 3000.0;
+static const NSUInteger kBleMaxChunkBytes = 244;
+static const double kBleBytesPerSecond = 8000.0;
 static const NSTimeInterval kBleLinkBusyRetry = 0.005;
 
 @interface FlutterPosPrinterPlatformPlugin ()
