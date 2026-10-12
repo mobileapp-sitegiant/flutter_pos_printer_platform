@@ -1,4 +1,5 @@
 #import "FlutterPosPrinterPlatformPlugin.h"
+#import <QuartzCore/QuartzCore.h>
 #import "ConnecterManager.h"
 #import "EscPosTokenizer.h"
 
@@ -11,11 +12,14 @@
 // garbage, stops halfway, or comes out as a single line feed.
 //
 // The writer below sends the payload as command-aligned units (see
-// EscPosTokenizer) and, after each unit, waits roughly as long as the print
-// head needs to physically render it (feed distance at a worst-case print
-// speed). Pauses never fall inside a command: firmware aborts a command whose
-// parameter bytes stall and prints the remainder as text.
+// EscPosTokenizer) and estimates when the print head finishes each one (feed
+// distance at a worst-case print speed). It runs ahead of the printer by at
+// most kPrintLeadMs of work and kMaxBufferedBytes of data, so the printer never
+// drains and idles between units. Pauses never fall inside a command: firmware
+// aborts a command whose parameter bytes stall and prints the remainder as text.
 static const NSUInteger kBleMaxChunkBytes = 244;
+static const double kPrintLeadMs = 250.0;         // work kept queued at the printer
+static const NSUInteger kMaxBufferedBytes = 2048; // unprinted bytes allowed in the printer
 static const NSTimeInterval kBleLinkBusyRetry = 0.005;
 static const double kPrintSpeedMmPerMs = 0.08;   // 80 mm/s, slowest common tier
 static const double kDotsPerMm = 8.0;            // 203 dpi
@@ -31,6 +35,11 @@ static const double kUnknownDataBytesPerMs = 8.0; // fallback: 8 KB/s for unpars
 @property(nonatomic) NSMutableDictionary *scannedPeripherals;
 @property(nonatomic, strong) NSMutableArray<NSData *> *pendingWrites;
 @property(nonatomic, assign) BOOL bleWriteInProgress;
+// Estimated time (ms, CACurrentMediaTime) the printer finishes all sent units.
+@property(nonatomic, assign) double printerBusyUntilMs;
+// Sent units the printer has not finished yet, oldest first.
+@property(nonatomic, strong) NSMutableArray<NSNumber *> *inFlightFinishMs;
+@property(nonatomic, strong) NSMutableArray<NSNumber *> *inFlightBytes;
 @end
 
 @implementation FlutterPosPrinterPlatformPlugin
@@ -330,13 +339,18 @@ static double pacingMsForUnit(const uint8_t *b, NSRange unit, BOOL atomic,
         return;
     }
     const NSRange unit = [units[index] rangeValue];
-    const double delayMs = delaysMs[index].doubleValue;
+    const double renderMs = delaysMs[index].doubleValue;
     __weak typeof(self) weakSelf = self;
-    dispatch_block_t next = ^{
-        [weakSelf sendUnitAtIndex:index + 1 units:units delaysMs:delaysMs data:data
-                            chunk:chunk type:type peripheral:peripheral
-                   characteristic:characteristic];
-    };
+    const double waitMs = [self waitMsBeforeSendingBytes:unit.length];
+    if (waitMs > 0) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(waitMs * NSEC_PER_MSEC)),
+                       dispatch_get_main_queue(), ^{
+            [weakSelf sendUnitAtIndex:index units:units delaysMs:delaysMs data:data
+                                chunk:chunk type:type peripheral:peripheral
+                       characteristic:characteristic];
+        });
+        return;
+    }
     [self writeUnit:unit
              offset:unit.location
                data:data
@@ -345,12 +359,10 @@ static double pacingMsForUnit(const uint8_t *b, NSRange unit, BOOL atomic,
          peripheral:peripheral
      characteristic:characteristic
          completion:^{
-        if (delayMs <= 0) {
-            next();
-            return;
-        }
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayMs * NSEC_PER_MSEC)),
-                       dispatch_get_main_queue(), next);
+        [weakSelf recordSentBytes:unit.length renderMs:renderMs];
+        [weakSelf sendUnitAtIndex:index + 1 units:units delaysMs:delaysMs data:data
+                            chunk:chunk type:type peripheral:peripheral
+                   characteristic:characteristic];
     }];
 }
 
@@ -375,6 +387,7 @@ static double pacingMsForUnit(const uint8_t *b, NSRange unit, BOOL atomic,
               (unsigned long)offset, (unsigned long)data.length);
         self.bleWriteInProgress = NO;
         [self.pendingWrites removeAllObjects];
+        [self resetPrinterBacklog];
         return;
     }
     __weak typeof(self) weakSelf = self;
@@ -396,6 +409,51 @@ static double pacingMsForUnit(const uint8_t *b, NSRange unit, BOOL atomic,
         [weakSelf writeUnit:unit offset:offset + len data:data chunk:chunk type:type
                  peripheral:peripheral characteristic:characteristic completion:completion];
     });
+}
+
+static double nowMs(void) {
+    return CACurrentMediaTime() * 1000.0;
+}
+
+/// Adds a sent unit to the printer backlog estimate.
+- (void)recordSentBytes:(NSUInteger)length renderMs:(double)renderMs {
+    if (self.inFlightFinishMs == nil) {
+        self.inFlightFinishMs = [NSMutableArray new];
+        self.inFlightBytes = [NSMutableArray new];
+    }
+    self.printerBusyUntilMs = MAX(nowMs(), self.printerBusyUntilMs) + MAX(renderMs, 0);
+    [self.inFlightFinishMs addObject:@(self.printerBusyUntilMs)];
+    [self.inFlightBytes addObject:@(length)];
+}
+
+/// How long to hold a unit of [length] bytes so the printer keeps at most
+/// kPrintLeadMs of work and kMaxBufferedBytes of data queued. 0 = send now.
+- (double)waitMsBeforeSendingBytes:(NSUInteger)length {
+    const double now = nowMs();
+    while (self.inFlightFinishMs.count > 0 &&
+           self.inFlightFinishMs.firstObject.doubleValue <= now) {
+        [self.inFlightFinishMs removeObjectAtIndex:0];
+        [self.inFlightBytes removeObjectAtIndex:0];
+    }
+
+    double sendAtMs = self.printerBusyUntilMs - kPrintLeadMs;
+    NSUInteger buffered = 0;
+    for (NSNumber *bytes in self.inFlightBytes) {
+        buffered += bytes.unsignedIntegerValue;
+    }
+    // Wait for the oldest units to print until the new one fits the buffer.
+    for (NSUInteger i = 0; i < self.inFlightBytes.count && buffered + length > kMaxBufferedBytes; i++) {
+        buffered -= self.inFlightBytes[i].unsignedIntegerValue;
+        sendAtMs = MAX(sendAtMs, self.inFlightFinishMs[i].doubleValue);
+    }
+    const double waitMs = sendAtMs - now;
+    return waitMs >= 1.0 ? waitMs : 0;
+}
+
+- (void)resetPrinterBacklog {
+    self.printerBusyUntilMs = 0;
+    [self.inFlightFinishMs removeAllObjects];
+    [self.inFlightBytes removeAllObjects];
 }
 
 -(void)startScan {
