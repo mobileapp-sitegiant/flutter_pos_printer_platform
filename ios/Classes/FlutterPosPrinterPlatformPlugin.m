@@ -12,16 +12,17 @@
 // garbage, stops halfway, or comes out as a single line feed.
 //
 // The writer below sends the payload as command-aligned units (see
-// EscPosTokenizer) and estimates when the print head finishes each one (feed
-// distance at a worst-case print speed). It runs ahead of the printer by at
-// most kPrintLeadMs of work and kMaxBufferedBytes of data, so the printer never
-// drains and idles between units. Pauses never fall inside a command: firmware
-// aborts a command whose parameter bytes stall and prints the remainder as text.
+// EscPosTokenizer), merged into full BLE packets, and estimates when the print
+// head finishes each one (feed distance at kPrintSpeedMmPerMs). It runs ahead
+// of the printer by at most kPrintLeadMs of work and kMaxBufferedBytes of data,
+// so the printer never drains and idles between units. Pauses never fall inside
+// a command: firmware aborts a command whose parameter bytes stall and prints
+// the remainder as text.
 static const NSUInteger kBleMaxChunkBytes = 244;
-static const double kPrintLeadMs = 250.0;         // work kept queued at the printer
+static const double kPrintLeadMs = 500.0;         // work kept queued at the printer
 static const NSUInteger kMaxBufferedBytes = 2048; // unprinted bytes allowed in the printer
 static const NSTimeInterval kBleLinkBusyRetry = 0.005;
-static const double kPrintSpeedMmPerMs = 0.08;   // 80 mm/s, slowest common tier
+static const double kPrintSpeedMmPerMs = 0.2;    // 200 mm/s, desktop 80mm tier
 static const double kDotsPerMm = 8.0;            // 203 dpi
 static const NSUInteger kTextLineHeightDots = 32; // font A line + spacing, conservative
 static const double kFeedSafetyMarginMs = 5.0;   // per feeding unit, covers link jitter
@@ -245,6 +246,31 @@ static double pacingMsForUnit(const uint8_t *b, NSRange unit, BOOL atomic,
     return 0;
 }
 
+/// Merges neighbouring units that fit one BLE packet. Every write costs a
+/// packet, so line feeds and short commands sent alone starve the printer.
+static void coalesceUnits(NSMutableArray<NSValue *> *units,
+                          NSMutableArray<NSNumber *> *delaysMs, NSUInteger chunk) {
+    if (units.count == 0) {
+        return;
+    }
+    NSUInteger last = 0;
+    for (NSUInteger i = 1; i < units.count; i++) {
+        const NSRange previous = units[last].rangeValue;
+        const NSRange current = units[i].rangeValue;
+        if (NSMaxRange(previous) == current.location && previous.length + current.length <= chunk) {
+            units[last] = [NSValue valueWithRange:NSMakeRange(previous.location,
+                                                              previous.length + current.length)];
+            delaysMs[last] = @(delaysMs[last].doubleValue + delaysMs[i].doubleValue);
+            continue;
+        }
+        last++;
+        units[last] = units[i];
+        delaysMs[last] = delaysMs[i];
+    }
+    [units removeObjectsInRange:NSMakeRange(last + 1, units.count - last - 1)];
+    [delaysMs removeObjectsInRange:NSMakeRange(last + 1, delaysMs.count - last - 1)];
+}
+
 /// Pops the next payload and sends it as command-aligned units. Pauses are
 /// inserted only between units, never inside an ESC/POS command.
 - (void)startNextPacedWriteIfIdle {
@@ -307,6 +333,8 @@ static double pacingMsForUnit(const uint8_t *b, NSRange unit, BOOL atomic,
             offset += len;
         }
     }
+
+    coalesceUnits(units, delaysMs, chunk);
 
     NSLog(@"paced BLE write start: %lu bytes, %lu units, chunk=%lu, type=%@, est. %.1fs",
           (unsigned long)data.length, (unsigned long)units.count, (unsigned long)chunk,
