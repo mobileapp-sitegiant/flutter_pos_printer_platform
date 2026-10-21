@@ -23,6 +23,7 @@ static const double kPrintLeadMs = 500.0;         // work kept queued at the pri
 static const NSUInteger kMaxBufferedBytes = 2048; // unprinted bytes allowed in the printer
 static const NSTimeInterval kBleLinkBusyRetry = 0.005;
 static const double kPrintSpeedMmPerMs = 0.2;    // 200 mm/s, desktop 80mm tier
+static const double kImageSpeedMmPerMs = 0.05;   // 50 mm/s: dense bit images print slower, more so with a hot head
 static const double kDotsPerMm = 8.0;            // 203 dpi
 static const NSUInteger kTextLineHeightDots = 32; // font A line + spacing, conservative
 static const double kFeedSafetyMarginMs = 5.0;   // per feeding unit, covers link jitter
@@ -187,6 +188,13 @@ static double msForFeedDots(double dots) {
     return (dots / kDotsPerMm) / kPrintSpeedMmPerMs + kFeedSafetyMarginMs;
 }
 
+static double msForImageDots(double dots) {
+    if (dots <= 0) {
+        return 0;
+    }
+    return (dots / kDotsPerMm) / kImageSpeedMmPerMs + kFeedSafetyMarginMs;
+}
+
 /// Milliseconds the printer needs to render one unit. `rasterWidthBytes` is
 /// the row width of the GS v 0 image whose data is currently streaming (0 when
 /// not inside one).
@@ -218,7 +226,7 @@ static double pacingMsForUnit(const uint8_t *b, NSRange unit, BOOL atomic,
     if (c0 == 0x1b) {
         switch (c1) {
             case '*':  // ESC * m nL nH: 24-dot (m >= 32) or 8-dot strip
-                return msForFeedDots(c2 >= 32 ? 24 : 8);
+                return msForImageDots(c2 >= 32 ? 24 : 8);
             case 'd':  // ESC d n: feed n lines
             case 'e':
                 return msForFeedDots((double)c2 * kTextLineHeightDots);
