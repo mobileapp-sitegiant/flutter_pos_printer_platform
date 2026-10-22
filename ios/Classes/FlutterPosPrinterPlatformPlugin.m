@@ -212,9 +212,10 @@ static double pacingMsForUnit(const uint8_t *b, NSRange unit, BOOL atomic,
             return msForFeedDots(kTextLineHeightDots);
         }
         if (*rasterWidthBytes > 0) {
-            // GS v 0 pixel rows: one row per widthBytes.
-            double rows = ceil((double)unit.length / (double)*rasterWidthBytes);
-            return msForFeedDots(rows);
+            // GS v 0 pixel rows at image speed. Exact rows, no per-unit margin,
+            // so the rate does not depend on the BLE packet size.
+            double rows = (double)unit.length / (double)*rasterWidthBytes;
+            return (rows / kDotsPerMm) / kImageSpeedMmPerMs;
         }
         // Text run without a line feed: nothing prints yet.
         return 0;
