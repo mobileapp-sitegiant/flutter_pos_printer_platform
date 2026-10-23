@@ -30,6 +30,9 @@ static const double kFeedSafetyMarginMs = 5.0;   // per feeding unit, covers lin
 static const double kCutSettleMs = 500.0;         // autocutter mechanical cycle
 static const double kUnknownDataBytesPerMs = 8.0; // fallback: 8 KB/s for unparsed data
 static const NSTimeInterval kBurstReadyFallback = 0.002; // if the ready callback never comes
+static const double kBurstConnectQuietMs = 250.0; // GATT discovery after a fresh connect fills the link
+
+static double nowMs(void);
 
 static NSString *const kBleReadyToWriteNotification = @"FlutterPosPrinterBleReadyToWrite";
 
@@ -63,6 +66,7 @@ typedef struct {
 @property(nonatomic, assign) BOOL burstImages;
 @property(nonatomic, copy) dispatch_block_t onReadyToWrite;
 @property(nonatomic, assign) NSUInteger readyToWriteGeneration;
+@property(nonatomic, assign) double lastConnectEventMs;
 @property(nonatomic, strong) NSMutableData *packetLog;
 @property(nonatomic, assign) BOOL bleWriteInProgress;
 // Estimated time (ms, CACurrentMediaTime) the printer finishes all sent units.
@@ -393,6 +397,20 @@ static void coalesceUnits(NSMutableArray<NSValue *> *units,
 - (void)startNextPacedWriteIfIdle {
     if (self.bleWriteInProgress || self.pendingWrites.count == 0) {
         return;
+    }
+    if (self.pendingBurstImages.firstObject.boolValue) {
+        // Right after a (re)connect, service discovery shares the link and
+        // would stall the first image mid-command.
+        const double holdMs = self.lastConnectEventMs + kBurstConnectQuietMs - nowMs();
+        if (holdMs > 0) {
+            NSLog(@"imageBurst start held %.0fms after connect", holdMs);
+            __weak typeof(self) weakSelf = self;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(holdMs * NSEC_PER_MSEC)),
+                           dispatch_get_main_queue(), ^{
+                [weakSelf startNextPacedWriteIfIdle];
+            });
+            return;
+        }
     }
     NSData *data = self.pendingWrites.firstObject;
     [self.pendingWrites removeObjectAtIndex:0];
@@ -730,6 +748,7 @@ static double nowMs(void) {
 
 -(void)updateConnectState:(ConnectState)state {
     dispatch_async(dispatch_get_main_queue(), ^{
+        self.lastConnectEventMs = nowMs();
         NSNumber *ret = @0;
         switch (state) {
             case CONNECT_STATE_CONNECTING:

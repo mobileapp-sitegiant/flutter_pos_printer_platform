@@ -3,6 +3,7 @@
   - `paced` (default): the paced, command-aligned writer, unchanged.
   - `imageBurst`: the paced writer, but each image command (an `ESC *` strip, or a `GS v 0` header with its pixel data) is sent as one uninterrupted burst: no pacing wait inside it, and the link queue is refilled on `peripheralIsReadyToSendWriteWithoutResponse:` instead of 5 ms polling. Some XPrinter firmware abandons an image whose bytes arrive with gaps.
   - `sdk`: GSDK's own writer (130-byte writes with response, as in app v1.6.45).
+* [iOS] `imageBurst` holds a job until 250 ms after the last connect event: service discovery after a fresh connect shares the link and stalled the first image (122 ms gap after a printer power cycle).
 * [iOS] Logs, per image command, the number of writes, their time span and the largest gap between them.
 
 ## 1.2.5
