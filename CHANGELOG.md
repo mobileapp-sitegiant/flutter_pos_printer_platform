@@ -1,3 +1,6 @@
+## 1.2.6
+* [iOS] Opt-in compatible Bluetooth sending: `BluetoothPrinterConnector.instance.iosCompatibleSending = true` sends through GSDK's own writer (130-byte writes with response, as in v1.6.45 of the app) instead of the paced writer. Logs `SDK BLE write start` / `acknowledged` with packet sizes and timing
+
 ## 1.2.5
 * [iOS] Fix fatal crash `NSInternalInconsistencyException: Invalid parameter not satisfying: peripheral != nil` — GSDK's connect-timeout timer calls `cancelPeripheralConnection:` with a nil peripheral when the printer is unreachable; guarded at runtime via `CBCentralManagerSafeCancel`
 * [iOS] Clear dangling `_connecter` reference in `ConnecterManager close`

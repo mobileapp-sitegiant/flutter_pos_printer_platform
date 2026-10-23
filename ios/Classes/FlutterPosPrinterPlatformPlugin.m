@@ -147,7 +147,9 @@ static const double kUnknownDataBytesPerMs = 8.0; // fallback: 8 KB/s for unpars
            }
            NSData *data2 = [NSData dataWithBytes:cArray length:sizeof(cArray)];
 //           NSLog(@"bytes in hex: %@", [data2 description]);
-           if (![self enqueuePacedWrite:data2]) {
+           if ([[args objectForKey:@"compatibleSending"] boolValue]) {
+               [self writeThroughSdk:data2];
+           } else if (![self enqueuePacedWrite:data2]) {
                // No BLE peripheral/characteristic exposed by GSDK: fall back
                // to the SDK's own writer.
                [Manager write:data2];
@@ -490,6 +492,28 @@ static double nowMs(void) {
     self.printerBusyUntilMs = 0;
     [self.inFlightFinishMs removeAllObjects];
     [self.inFlightBytes removeAllObjects];
+}
+
+#pragma mark - Compatible sending
+
+/// Sends [data] through GSDK's own writer, as v1.6.45 did: 130-byte writes
+/// with response, so the printer acknowledges each packet before the next.
+- (void)writeThroughSdk:(NSData *)data {
+    BLEConnecter *ble = Manager.bleConnecter;
+    CBPeripheral *peripheral = ble.connPeripheral;
+    CBCharacteristic *characteristic = ble.transparentDataWriteChar;
+    NSLog(@"SDK BLE write start: %lu bytes, datagram=%lu, maxResp=%lu, maxNoResp=%lu, noRespSupported=%d",
+          (unsigned long)data.length, (unsigned long)ble.datagramSize,
+          (unsigned long)[peripheral maximumWriteValueLengthForType:CBCharacteristicWriteWithResponse],
+          (unsigned long)[peripheral maximumWriteValueLengthForType:CBCharacteristicWriteWithoutResponse],
+          (characteristic.properties & CBCharacteristicPropertyWriteWithoutResponse) != 0);
+    const double startMs = nowMs();
+    [Manager write:data progress:^(NSUInteger total, NSUInteger progress) {
+        if (progress >= total) {
+            NSLog(@"SDK BLE write acknowledged: %lu bytes in %.1fs",
+                  (unsigned long)total, (nowMs() - startMs) / 1000.0);
+        }
+    } receCallBack:nil];
 }
 
 -(void)startScan {
