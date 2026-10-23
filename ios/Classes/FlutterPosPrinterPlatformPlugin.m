@@ -29,6 +29,28 @@ static const NSUInteger kTextLineHeightDots = 32; // font A line + spacing, cons
 static const double kFeedSafetyMarginMs = 5.0;   // per feeding unit, covers link jitter
 static const double kCutSettleMs = 500.0;         // autocutter mechanical cycle
 static const double kUnknownDataBytesPerMs = 8.0; // fallback: 8 KB/s for unparsed data
+static const NSTimeInterval kBurstReadyFallback = 0.002; // if the ready callback never comes
+
+static NSString *const kBleReadyToWriteNotification = @"FlutterPosPrinterBleReadyToWrite";
+
+/// One BLE write (or, for the SDK writer, one acknowledged chunk), for timing logs.
+typedef struct {
+    NSUInteger offset;
+    NSUInteger length;
+    double ms;
+} PacketLogEntry;
+
+// GSDK owns the peripheral delegate but does not implement this callback;
+// adding it tells the burst writer the moment the link queue has room again.
+@interface BLEConnecter (ReadyToWrite)
+@end
+
+@implementation BLEConnecter (ReadyToWrite)
+- (void)peripheralIsReadyToSendWriteWithoutResponse:(CBPeripheral *)peripheral {
+    [[NSNotificationCenter defaultCenter] postNotificationName:kBleReadyToWriteNotification
+                                                        object:peripheral];
+}
+@end
 
 @interface FlutterPosPrinterPlatformPlugin ()
 @property(nonatomic, retain) NSObject<FlutterPluginRegistrar> *registrar;
@@ -36,6 +58,12 @@ static const double kUnknownDataBytesPerMs = 8.0; // fallback: 8 KB/s for unpars
 @property(nonatomic, retain) BluetoothPrintStreamHandler *stateStreamHandler;
 @property(nonatomic) NSMutableDictionary *scannedPeripherals;
 @property(nonatomic, strong) NSMutableArray<NSData *> *pendingWrites;
+// Per queued payload: send each image command as one uninterrupted burst.
+@property(nonatomic, strong) NSMutableArray<NSNumber *> *pendingBurstImages;
+@property(nonatomic, assign) BOOL burstImages;
+@property(nonatomic, copy) dispatch_block_t onReadyToWrite;
+@property(nonatomic, assign) NSUInteger readyToWriteGeneration;
+@property(nonatomic, strong) NSMutableData *packetLog;
 @property(nonatomic, assign) BOOL bleWriteInProgress;
 // Estimated time (ms, CACurrentMediaTime) the printer finishes all sent units.
 @property(nonatomic, assign) double printerBusyUntilMs;
@@ -59,6 +87,14 @@ static const double kUnknownDataBytesPerMs = 8.0; // fallback: 8 KB/s for unpars
   BluetoothPrintStreamHandler* stateStreamHandler = [[BluetoothPrintStreamHandler alloc] init];
   [stateChannel setStreamHandler:stateStreamHandler];
   instance.stateStreamHandler = stateStreamHandler;
+
+  __weak FlutterPosPrinterPlatformPlugin *weakInstance = instance;
+  [[NSNotificationCenter defaultCenter] addObserverForName:kBleReadyToWriteNotification
+                                                    object:nil
+                                                     queue:[NSOperationQueue mainQueue]
+                                                usingBlock:^(NSNotification *note) {
+      [weakInstance fireReadyToWrite];
+  }];
 
   [registrar addMethodCallDelegate:instance channel:channel];
 }
@@ -147,9 +183,11 @@ static const double kUnknownDataBytesPerMs = 8.0; // fallback: 8 KB/s for unpars
            }
            NSData *data2 = [NSData dataWithBytes:cArray length:sizeof(cArray)];
 //           NSLog(@"bytes in hex: %@", [data2 description]);
-           if ([[args objectForKey:@"compatibleSending"] boolValue]) {
+           NSString *sendingMode = [args objectForKey:@"sendingMode"];
+           if ([@"sdk" isEqualToString:sendingMode]) {
                [self writeThroughSdk:data2];
-           } else if (![self enqueuePacedWrite:data2]) {
+           } else if (![self enqueuePacedWrite:data2
+                                   burstImages:[@"imageBurst" isEqualToString:sendingMode]]) {
                // No BLE peripheral/characteristic exposed by GSDK: fall back
                // to the SDK's own writer.
                [Manager write:data2];
@@ -165,7 +203,7 @@ static const double kUnknownDataBytesPerMs = 8.0; // fallback: 8 KB/s for unpars
 
 /// Queues [data] for paced delivery. Returns NO when GSDK has not exposed a
 /// connected peripheral + write characteristic (caller falls back to GSDK).
-- (BOOL)enqueuePacedWrite:(NSData *)data {
+- (BOOL)enqueuePacedWrite:(NSData *)data burstImages:(BOOL)burstImages {
     BLEConnecter *ble = Manager.bleConnecter;
     CBPeripheral *peripheral = ble.connPeripheral;
     CBCharacteristic *characteristic = ble.transparentDataWriteChar;
@@ -175,8 +213,10 @@ static const double kUnknownDataBytesPerMs = 8.0; // fallback: 8 KB/s for unpars
     }
     if (self.pendingWrites == nil) {
         self.pendingWrites = [NSMutableArray new];
+        self.pendingBurstImages = [NSMutableArray new];
     }
     [self.pendingWrites addObject:data];
+    [self.pendingBurstImages addObject:@(burstImages)];
     NSLog(@"paced BLE write queued: %lu bytes (queue=%lu)",
           (unsigned long)data.length, (unsigned long)self.pendingWrites.count);
     [self startNextPacedWriteIfIdle];
@@ -256,6 +296,73 @@ static double pacingMsForUnit(const uint8_t *b, NSRange unit, BOOL atomic,
     return 0;
 }
 
+static BOOL isRasterHeader(const uint8_t *b, NSRange range) {
+    return range.length == 8 && b[range.location] == 0x1d &&
+        b[range.location + 1] == 'v' && b[range.location + 2] == '0';
+}
+
+/// Range of the GS v 0 header at [index] plus the pixel data token after it.
+static NSRange rasterCommandRange(NSArray<EscPosToken *> *tokens, NSUInteger index) {
+    NSRange range = tokens[index].range;
+    if (index + 1 < tokens.count && !tokens[index + 1].atomic &&
+        tokens[index + 1].range.location == NSMaxRange(range)) {
+        range.length += tokens[index + 1].range.length;
+    }
+    return range;
+}
+
+/// Byte ranges of the image commands: each ESC * strip, and each GS v 0
+/// header together with its pixel data.
+static NSArray<NSValue *> *imageCommandRanges(const uint8_t *b, NSArray<EscPosToken *> *tokens) {
+    NSMutableArray<NSValue *> *ranges = [NSMutableArray new];
+    for (NSUInteger i = 0; i < tokens.count; i++) {
+        const NSRange range = tokens[i].range;
+        if (!tokens[i].atomic || range.length < 3) {
+            continue;
+        }
+        if (b[range.location] == 0x1b && b[range.location + 1] == '*') {
+            [ranges addObject:[NSValue valueWithRange:range]];
+        } else if (isRasterHeader(b, range)) {
+            const NSRange whole = rasterCommandRange(tokens, i);
+            [ranges addObject:[NSValue valueWithRange:whole]];
+            if (whole.length > range.length) {
+                i++;
+            }
+        }
+    }
+    return ranges;
+}
+
+/// Logs, per image command, how many writes carried it and the largest gap
+/// between them. Firmware can abort an image whose bytes arrive with gaps.
+static void logImageTiming(NSString *label, const uint8_t *b, NSArray<NSValue *> *ranges,
+                           NSData *packetLog) {
+    const PacketLogEntry *entries = packetLog.bytes;
+    const NSUInteger count = packetLog.length / sizeof(PacketLogEntry);
+    for (NSUInteger k = 0; k < ranges.count; k++) {
+        const NSRange range = ranges[k].rangeValue;
+        NSUInteger packets = 0;
+        double firstMs = 0, previousMs = 0, maxGapMs = 0;
+        for (NSUInteger i = 0; i < count; i++) {
+            const NSRange packet = NSMakeRange(entries[i].offset, entries[i].length);
+            if (NSIntersectionRange(packet, range).length == 0) {
+                continue;
+            }
+            if (packets == 0) {
+                firstMs = entries[i].ms;
+            } else {
+                maxGapMs = MAX(maxGapMs, entries[i].ms - previousMs);
+            }
+            previousMs = entries[i].ms;
+            packets++;
+        }
+        NSLog(@"%@ image %lu %@ @%lu %luB: %lu writes, span %.1fms, max gap %.1fms",
+              label, (unsigned long)k, b[range.location] == 0x1b ? @"ESC*" : @"GSv0",
+              (unsigned long)range.location, (unsigned long)range.length,
+              (unsigned long)packets, previousMs - firstMs, maxGapMs);
+    }
+}
+
 /// Merges neighbouring units that fit one BLE packet. Every write costs a
 /// packet, so line feeds and short commands sent alone starve the printer.
 static void coalesceUnits(NSMutableArray<NSValue *> *units,
@@ -289,6 +396,9 @@ static void coalesceUnits(NSMutableArray<NSValue *> *units,
     }
     NSData *data = self.pendingWrites.firstObject;
     [self.pendingWrites removeObjectAtIndex:0];
+    self.burstImages = self.pendingBurstImages.firstObject.boolValue;
+    [self.pendingBurstImages removeObjectAtIndex:0];
+    self.packetLog = [NSMutableData new];
 
     BLEConnecter *ble = Manager.bleConnecter;
     CBPeripheral *peripheral = ble.connPeripheral;
@@ -315,7 +425,24 @@ static void coalesceUnits(NSMutableArray<NSValue *> *units,
     NSMutableArray<NSNumber *> *delaysMs = [NSMutableArray new];
     NSUInteger rasterWidthBytes = 0;
     double totalMs = 0;
-    for (EscPosToken *token in [EscPosTokenizer tokenize:data]) {
+    NSArray<EscPosToken *> *tokens = [EscPosTokenizer tokenize:data];
+    for (NSUInteger i = 0; i < tokens.count; i++) {
+        EscPosToken *token = tokens[i];
+        if (self.burstImages && token.atomic && isRasterHeader(bytes, token.range)) {
+            // Header and pixel data as one unit: no pacing wait inside the image.
+            const NSRange whole = rasterCommandRange(tokens, i);
+            const NSUInteger widthBytes = bytes[whole.location + 4] | (bytes[whole.location + 5] << 8);
+            const double rows = widthBytes > 0 ? (double)(whole.length - 8) / widthBytes : 0;
+            const double ms = msForFeedDots(rows);
+            [units addObject:[NSValue valueWithRange:whole]];
+            [delaysMs addObject:@(ms)];
+            totalMs += ms;
+            rasterWidthBytes = 0;
+            if (whole.length > token.range.length) {
+                i++;
+            }
+            continue;
+        }
         if (token.atomic || token.range.length <= chunk) {
             double ms = pacingMsForUnit(bytes, token.range, token.atomic, &rasterWidthBytes);
             if (!token.atomic && rasterWidthBytes == 0 && bytes[token.range.location] != 0x0a
@@ -346,10 +473,10 @@ static void coalesceUnits(NSMutableArray<NSValue *> *units,
 
     coalesceUnits(units, delaysMs, chunk);
 
-    NSLog(@"paced BLE write start: %lu bytes, %lu units, chunk=%lu, type=%@, est. %.1fs",
+    NSLog(@"paced BLE write start: %lu bytes, %lu units, chunk=%lu, type=%@, mode=%@, est. %.1fs",
           (unsigned long)data.length, (unsigned long)units.count, (unsigned long)chunk,
           type == CBCharacteristicWriteWithoutResponse ? @"noResp" : @"resp",
-          totalMs / 1000.0);
+          self.burstImages ? @"imageBurst" : @"paced", totalMs / 1000.0);
 
     self.bleWriteInProgress = YES;
     [self sendUnitAtIndex:0
@@ -372,6 +499,9 @@ static void coalesceUnits(NSMutableArray<NSValue *> *units,
          characteristic:(CBCharacteristic *)characteristic {
     if (index >= units.count) {
         NSLog(@"paced BLE write done: %lu bytes", (unsigned long)data.length);
+        logImageTiming(self.burstImages ? @"imageBurst" : @"paced", data.bytes,
+                       imageCommandRanges(data.bytes, [EscPosTokenizer tokenize:data]),
+                       self.packetLog);
         self.bleWriteInProgress = NO;
         [self startNextPacedWriteIfIdle];
         return;
@@ -425,24 +555,50 @@ static void coalesceUnits(NSMutableArray<NSValue *> *units,
               (unsigned long)offset, (unsigned long)data.length);
         self.bleWriteInProgress = NO;
         [self.pendingWrites removeAllObjects];
+        [self.pendingBurstImages removeAllObjects];
+        self.onReadyToWrite = nil;
         [self resetPrinterBacklog];
         return;
     }
     __weak typeof(self) weakSelf = self;
     if (type == CBCharacteristicWriteWithoutResponse &&
         !peripheral.canSendWriteWithoutResponse) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                     (int64_t)(kBleLinkBusyRetry * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
+        dispatch_block_t resume = ^{
             [weakSelf writeUnit:unit offset:offset data:data chunk:chunk type:type
                      peripheral:peripheral characteristic:characteristic completion:completion];
-        });
+        };
+        if (self.burstImages) {
+            [self waitForWriteRoom:resume];
+        } else {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(kBleLinkBusyRetry * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), resume);
+        }
+        return;
+    }
+    if (self.burstImages) {
+        // Fill CoreBluetooth's queue in one turn so a command reaches the
+        // printer without gaps; continue as soon as the link has room.
+        NSUInteger next = offset;
+        do {
+            const NSUInteger len = MIN(chunk, end - next);
+            [self writePacket:NSMakeRange(next, len) data:data type:type
+                   peripheral:peripheral characteristic:characteristic];
+            next += len;
+        } while (next < end && (type != CBCharacteristicWriteWithoutResponse ||
+                                peripheral.canSendWriteWithoutResponse));
+        if (next >= end) {
+            // Hop between units, not inside one, so long jobs do not nest calls.
+            dispatch_async(dispatch_get_main_queue(), completion);
+        } else {
+            [self writeUnit:unit offset:next data:data chunk:chunk type:type
+                 peripheral:peripheral characteristic:characteristic completion:completion];
+        }
         return;
     }
     const NSUInteger len = MIN(chunk, end - offset);
-    [peripheral writeValue:[data subdataWithRange:NSMakeRange(offset, len)]
-         forCharacteristic:characteristic
-                      type:type];
+    [self writePacket:NSMakeRange(offset, len) data:data type:type
+           peripheral:peripheral characteristic:characteristic];
     dispatch_async(dispatch_get_main_queue(), ^{
         [weakSelf writeUnit:unit offset:offset + len data:data chunk:chunk type:type
                  peripheral:peripheral characteristic:characteristic completion:completion];
@@ -451,6 +607,41 @@ static void coalesceUnits(NSMutableArray<NSValue *> *units,
 
 static double nowMs(void) {
     return CACurrentMediaTime() * 1000.0;
+}
+
+- (void)writePacket:(NSRange)packet
+               data:(NSData *)data
+               type:(CBCharacteristicWriteType)type
+         peripheral:(CBPeripheral *)peripheral
+     characteristic:(CBCharacteristic *)characteristic {
+    [peripheral writeValue:[data subdataWithRange:packet]
+         forCharacteristic:characteristic
+                      type:type];
+    const PacketLogEntry entry = {packet.location, packet.length, nowMs()};
+    [self.packetLog appendBytes:&entry length:sizeof(entry)];
+}
+
+/// Runs [resume] when CoreBluetooth reports room for more writes, or after a
+/// short fallback in case that callback does not arrive.
+- (void)waitForWriteRoom:(dispatch_block_t)resume {
+    self.onReadyToWrite = resume;
+    const NSUInteger generation = ++self.readyToWriteGeneration;
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kBurstReadyFallback * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (weakSelf.readyToWriteGeneration == generation) {
+            [weakSelf fireReadyToWrite];
+        }
+    });
+}
+
+- (void)fireReadyToWrite {
+    dispatch_block_t resume = self.onReadyToWrite;
+    if (resume == nil) {
+        return;
+    }
+    self.onReadyToWrite = nil;
+    resume();
 }
 
 /// Adds a sent unit to the printer backlog estimate.
@@ -508,10 +699,17 @@ static double nowMs(void) {
           (unsigned long)[peripheral maximumWriteValueLengthForType:CBCharacteristicWriteWithoutResponse],
           (characteristic.properties & CBCharacteristicPropertyWriteWithoutResponse) != 0);
     const double startMs = nowMs();
+    NSMutableData *ackLog = [NSMutableData new];
+    __block NSUInteger acknowledged = 0;
     [Manager write:data progress:^(NSUInteger total, NSUInteger progress) {
+        const PacketLogEntry entry = {acknowledged, progress - acknowledged, nowMs()};
+        [ackLog appendBytes:&entry length:sizeof(entry)];
+        acknowledged = progress;
         if (progress >= total) {
             NSLog(@"SDK BLE write acknowledged: %lu bytes in %.1fs",
                   (unsigned long)total, (nowMs() - startMs) / 1000.0);
+            logImageTiming(@"sdk", data.bytes,
+                           imageCommandRanges(data.bytes, [EscPosTokenizer tokenize:data]), ackLog);
         }
     } receCallBack:nil];
 }

@@ -1,5 +1,9 @@
 ## 1.2.6
-* [iOS] Opt-in compatible Bluetooth sending: `BluetoothPrinterConnector.instance.iosCompatibleSending = true` sends through GSDK's own writer (130-byte writes with response, as in v1.6.45 of the app) instead of the paced writer. Logs `SDK BLE write start` / `acknowledged` with packet sizes and timing
+* [iOS] `BluetoothPrinterConnector.instance.iosSendingMode` (`IosBleSendingMode`), passed with every `writeData`:
+  - `paced` (default): the paced, command-aligned writer, unchanged.
+  - `imageBurst`: the paced writer, but each image command (an `ESC *` strip, or a `GS v 0` header with its pixel data) is sent as one uninterrupted burst: no pacing wait inside it, and the link queue is refilled on `peripheralIsReadyToSendWriteWithoutResponse:` instead of 5 ms polling. Some XPrinter firmware abandons an image whose bytes arrive with gaps.
+  - `sdk`: GSDK's own writer (130-byte writes with response, as in app v1.6.45).
+* [iOS] Logs, per image command, the number of writes, their time span and the largest gap between them.
 
 ## 1.2.5
 * [iOS] Fix fatal crash `NSInternalInconsistencyException: Invalid parameter not satisfying: peripheral != nil` — GSDK's connect-timeout timer calls `cancelPeripheralConnection:` with a nil peripheral when the printer is unreachable; guarded at runtime via `CBCentralManagerSafeCancel`

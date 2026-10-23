@@ -95,9 +95,8 @@ class BluetoothPrinterConnector
   BTStatus _status = BTStatus.none;
   BTStatus get status => _status;
 
-  /// iOS only: send through the printer SDK's own writer (writes with
-  /// response) instead of the paced writer, for printers that drop data.
-  bool iosCompatibleSending = false;
+  /// iOS only: how receipt bytes are sent to a Bluetooth LE printer.
+  IosBleSendingMode iosSendingMode = IosBleSendingMode.paced;
 
   StreamController<String> devices = new StreamController.broadcast();
 
@@ -261,7 +260,7 @@ class BluetoothPrinterConnector
         Map<String, Object> args = Map();
         args['bytes'] = bytes;
         args['length'] = bytes.length;
-        args['compatibleSending'] = iosCompatibleSending;
+        args['sendingMode'] = iosSendingMode.name;
         iosChannel.invokeMethod('writeData', args);
         return Future.value(true);
       } else {
