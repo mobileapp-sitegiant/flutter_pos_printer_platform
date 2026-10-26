@@ -15,6 +15,8 @@
 
 static ConnecterManager *manager;
 static dispatch_once_t once;
+// GSDK's own datagram size (set in BLEConnecter initParament).
+static const NSUInteger kGsdkDatagramSize = 130;
 
 +(instancetype)sharedInstance {
     dispatch_once(&once, ^{
@@ -97,6 +99,7 @@ static dispatch_once_t once;
     NSLog(@"[ConnecterManager] write:receCallBack:");
 #endif
     _bleConnecter.writeProgress = nil;
+    [self fitDatagramToPacket];
     [_connecter write:data receCallBack:callBack];
 }
 
@@ -105,7 +108,26 @@ static dispatch_once_t once;
     NSLog(@"[ConnecterManager] write:");
 #endif
     _bleConnecter.writeProgress = nil;
+    [self fitDatagramToPacket];
     [_connecter write:data];
+}
+
+// GSDK writes with response. A datagram bigger than one BLE packet turns into
+// an iOS long write (several round trips each), which makes images print slowly.
+-(void)fitDatagramToPacket {
+    CBPeripheral *peripheral = _bleConnecter.connPeripheral;
+    if (_connecter != _bleConnecter || peripheral == nil) {
+        return;
+    }
+    NSUInteger packetSize = [peripheral maximumWriteValueLengthForType:CBCharacteristicWriteWithoutResponse];
+    if (packetSize == 0) {
+        return;
+    }
+    NSUInteger datagramSize = MIN(kGsdkDatagramSize, packetSize);
+    if (_bleConnecter.datagramSize != datagramSize) {
+        NSLog(@"[ConnecterManager] datagramSize %lu -> %lu", (unsigned long)_bleConnecter.datagramSize, (unsigned long)datagramSize);
+        _bleConnecter.datagramSize = datagramSize;
+    }
 }
 
 -(void)close {

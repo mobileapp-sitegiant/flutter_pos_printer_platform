@@ -1,3 +1,6 @@
+## 1.2.6
+* [iOS] Cap GSDK's Bluetooth datagram size at the BLE packet size, so each write-with-response fits one packet instead of becoming a slow long write (image printing)
+
 ## 1.2.5
 * [iOS] Fix fatal crash `NSInternalInconsistencyException: Invalid parameter not satisfying: peripheral != nil` — GSDK's connect-timeout timer calls `cancelPeripheralConnection:` with a nil peripheral when the printer is unreachable; guarded at runtime via `CBCentralManagerSafeCancel`
 * [iOS] Clear dangling `_connecter` reference in `ConnecterManager close`
